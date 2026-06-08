@@ -60,11 +60,15 @@ def prev_year(letter, prev_letter, year):
 # ── Load data ─────────────────────────────────────────────────────────────────
 @st.cache_data
 def load_data():
-    lc = pd.read_csv("data/analysis/all_contracts_lifecycle.csv", parse_dates=["date"])
+    lc  = pd.read_csv("data/analysis/all_contracts_lifecycle.csv", parse_dates=["date"])
     tbl = pd.read_csv("data/analysis/all12_contract_tables.csv")
-    return lc, tbl
+    bot = pd.read_csv("data/bot/bot_bfoe_daily.csv", parse_dates=["date"])
+    bft = pd.read_csv("data/analysis/all12_bot_features.csv")
+    bic = pd.read_csv("data/analysis/all12_bot_ic.csv")
+    return lc, tbl, bot, bft, bic
 
-lc, tbl = load_data()
+lc, tbl, bot, bft, bic = load_data()
+bot_idx = bot.set_index("date")
 
 # ── Theme toggle ─────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -301,83 +305,94 @@ PREV1_COLOR = "#9b59b6"   # purple — prev-1
 PREV2_COLOR = "#e67e22"   # amber  — prev-2
 
 fig_comp = make_subplots(
-    rows=3, cols=1,
+    rows=4, cols=1,
     shared_xaxes=True,
     subplot_titles=[
         "Fly Price (CO1 slot)",
         "CO1-CO2 Backwardation",
         "Open Interest (thousands)",
+        "BOT: bid_imbal (3-day avg)  &  moc_net_bid (3-day avg)",
     ],
-    vertical_spacing=0.06,
-    row_heights=[0.40, 0.32, 0.28],
+    vertical_spacing=0.05,
+    row_heights=[0.32, 0.22, 0.22, 0.24],
 )
 
-# ── helper: add fly + backw + OI for one contract ────────────────────────────
+# ── Build rolling-3-day BOT series aligned to DTE for a single contract ──────
+def bot_dte_series(df_lc):
+    """
+    For each row in the CO1 lifecycle df, look up 3-day centred BOT average.
+    Returns a df with td_to_expiry, bid_imbal_3d, moc_net_bid_3d columns.
+    """
+    rows = []
+    for _, r in df_lc[df_lc["td_to_expiry"].notna()].iterrows():
+        d = r["date"]
+        window = bot_idx[
+            (bot_idx.index >= d - pd.Timedelta("4d")) &
+            (bot_idx.index <= d + pd.Timedelta("4d"))
+        ].copy()
+        if window.empty:
+            rows.append({"td_to_expiry": r["td_to_expiry"],
+                         "bid_imbal_3d": np.nan, "moc_net_bid_3d": np.nan})
+            continue
+        window = window.iloc[(window.index - d).to_series().abs().argsort()[:3]]
+        rows.append({
+            "td_to_expiry":  r["td_to_expiry"],
+            "bid_imbal_3d":  window["bid_imbal"].mean(),
+            "moc_net_bid_3d": window["moc_net_bid"].mean(),
+        })
+    return pd.DataFrame(rows).sort_values("td_to_expiry", ascending=False)
+
+# ── helper: add all 4 panels for one contract ─────────────────────────────────
 def add_comp_series(df, label, color, entry_dte, is_main=False):
     lw   = 2.2 if is_main else 1.4
     dash = "solid" if is_main else "dot"
 
-    # Row 1 — Fly line
-    fly_d = df[df["fly"].notna()]
+    def entry_marker(panel_df, y_col, row_n):
+        if entry_dte is None: return
+        nearest = panel_df.iloc[(panel_df["td_to_expiry"] - entry_dte).abs().argsort()[:1]]
+        if nearest.empty: return
+        fig_comp.add_trace(go.Scatter(
+            x=nearest["td_to_expiry"], y=nearest[y_col],
+            mode="markers", name=f"{label} entry",
+            marker=dict(symbol="circle", size=10, color=color,
+                        line=dict(width=2, color=TEXT)),
+            legendgroup=label, showlegend=False,
+            hovertemplate=f"<b>Entry td7</b> DTE %{{x:.0f}} %{{y:.3f}}<extra>{label}</extra>",
+        ), row=row_n, col=1)
+
+    # Row 1 — Fly
+    fly_d = df[df["fly"].notna()].copy()
     if not fly_d.empty:
         fig_comp.add_trace(go.Scatter(
             x=fly_d["td_to_expiry"], y=fly_d["fly"],
             mode="lines", name=label,
             line=dict(color=color, width=lw, dash=dash),
             legendgroup=label, showlegend=True,
-            hovertemplate=f"<b>{label}</b>  DTE %{{x:.0f}} → fly %{{y:.3f}}<extra></extra>",
+            hovertemplate=f"<b>{label}</b> DTE %{{x:.0f}} fly=%{{y:.3f}}<extra></extra>",
         ), row=1, col=1)
-        # Entry marker: dot at the actual td7 DTE position
-        if entry_dte is not None:
-            entry_row = fly_d[fly_d["td_to_expiry"] == entry_dte]
-            if entry_row.empty:
-                # nearest
-                idx = (fly_d["td_to_expiry"] - entry_dte).abs().idxmin()
-                entry_row = fly_d.loc[[idx]]
-            fig_comp.add_trace(go.Scatter(
-                x=entry_row["td_to_expiry"], y=entry_row["fly"],
-                mode="markers", name=f"{label} entry",
-                marker=dict(symbol="circle", size=10, color=color,
-                            line=dict(width=2, color=TEXT)),
-                legendgroup=label, showlegend=False,
-                hovertemplate=f"<b>Entry td7</b>  DTE %{{x:.0f}} fly %{{y:.3f}}<extra>{label}</extra>",
-            ), row=1, col=1)
+        entry_marker(fly_d, "fly", 1)
 
-    # Row 2 — Backwardation line
-    bw_d = df[df["backw"].notna()]
+    # Row 2 — Backwardation
+    bw_d = df[df["backw"].notna()].copy()
     if not bw_d.empty:
         fig_comp.add_trace(go.Scatter(
             x=bw_d["td_to_expiry"], y=bw_d["backw"],
             mode="lines", name=label,
             line=dict(color=color, width=lw, dash=dash),
             legendgroup=label, showlegend=False,
-            hovertemplate=f"<b>{label}</b>  DTE %{{x:.0f}} → backw %{{y:.3f}}<extra></extra>",
+            hovertemplate=f"<b>{label}</b> DTE %{{x:.0f}} backw=%{{y:.3f}}<extra></extra>",
         ), row=2, col=1)
-        # Entry marker on backw panel too
-        if entry_dte is not None:
-            bw_entry = bw_d[bw_d["td_to_expiry"] == entry_dte]
-            if bw_entry.empty:
-                idx = (bw_d["td_to_expiry"] - entry_dte).abs().idxmin()
-                bw_entry = bw_d.loc[[idx]]
-            fig_comp.add_trace(go.Scatter(
-                x=bw_entry["td_to_expiry"], y=bw_entry["backw"],
-                mode="markers", name=f"{label} entry bw",
-                marker=dict(symbol="circle", size=8, color=color,
-                            line=dict(width=1.5, color=TEXT)),
-                legendgroup=label, showlegend=False,
-                hovertemplate=f"<b>Entry td7</b>  DTE %{{x:.0f}} backw %{{y:.3f}}<extra>{label}</extra>",
-            ), row=2, col=1)
+        entry_marker(bw_d, "backw", 2)
 
-    # Row 3 — OI: bars for current contract, lines for prev contracts
-    oi_d = df[df["oi"].notna()]
+    # Row 3 — OI: bars for current, lines for prev
+    oi_d = df[df["oi"].notna()].copy()
     if not oi_d.empty:
         if is_main:
             fig_comp.add_trace(go.Bar(
                 x=oi_d["td_to_expiry"], y=oi_d["oi"] / 1000,
-                name=label,
-                marker_color=color, opacity=0.75,
+                name=label, marker_color=color, opacity=0.75,
                 legendgroup=label, showlegend=False,
-                hovertemplate=f"<b>{label}</b>  DTE %{{x:.0f}} → OI %{{y:,.0f}}k<extra></extra>",
+                hovertemplate=f"<b>{label}</b> DTE %{{x:.0f}} OI=%{{y:,.0f}}k<extra></extra>",
             ), row=3, col=1)
         else:
             fig_comp.add_trace(go.Scatter(
@@ -385,8 +400,29 @@ def add_comp_series(df, label, color, entry_dte, is_main=False):
                 mode="lines", name=label,
                 line=dict(color=color, width=1.4, dash="dot"),
                 legendgroup=label, showlegend=False,
-                hovertemplate=f"<b>{label}</b>  DTE %{{x:.0f}} → OI %{{y:,.0f}}k<extra></extra>",
+                hovertemplate=f"<b>{label}</b> DTE %{{x:.0f}} OI=%{{y:,.0f}}k<extra></extra>",
             ), row=3, col=1)
+
+    # Row 4 — BOT 3-day rolling: bid_imbal (left axis) + moc_net_bid (right axis)
+    bot_d = bot_dte_series(df)
+    bi_d  = bot_d[bot_d["bid_imbal_3d"].notna()]
+    mn_d  = bot_d[bot_d["moc_net_bid_3d"].notna()]
+    if not bi_d.empty:
+        fig_comp.add_trace(go.Scatter(
+            x=bi_d["td_to_expiry"], y=bi_d["bid_imbal_3d"],
+            mode="lines", name=f"{label} bid_imbal",
+            line=dict(color=color, width=lw, dash=dash),
+            legendgroup=label, showlegend=False,
+            hovertemplate=f"<b>{label}</b> DTE %{{x:.0f}} bid_imbal=%{{y:.3f}}<extra></extra>",
+        ), row=4, col=1)
+    if not mn_d.empty:
+        fig_comp.add_trace(go.Bar(
+            x=mn_d["td_to_expiry"], y=mn_d["moc_net_bid_3d"],
+            name=f"{label} moc_net",
+            marker_color=color, opacity=0.35,
+            legendgroup=label, showlegend=False,
+            hovertemplate=f"<b>{label}</b> DTE %{{x:.0f}} moc_net=%{{y:.0f}}<extra></extra>",
+        ), row=4, col=1)
 
 add_comp_series(curr_dte,  f"CO{contract_letter}{str(selected_year)[-2:]} (current)",
                 CURR_COLOR,  curr_entry_dte,  is_main=True)
@@ -397,31 +433,32 @@ if not prev2_dte.empty:
     add_comp_series(prev2_dte, f"CO{p2_letter}{str(p2_yr)[-2:]} (prev-2)",
                     PREV2_COLOR, prev2_entry_dte, is_main=False)
 
-# ── Reference lines on backw panel ───────────────────────────────────────────
-fig_comp.add_hline(y=0,    line=dict(color=GRID,       width=1,   dash="dash"), row=2, col=1)
-fig_comp.add_hline(y=0.5,  line=dict(color=LONG_COLOR, width=0.8, dash="dot"),  row=2, col=1)
-fig_comp.add_hline(y=-0.5, line=dict(color=SHORT_COLOR,width=0.8, dash="dot"),  row=2, col=1)
+# ── Reference lines ───────────────────────────────────────────────────────────
+fig_comp.add_hline(y=0,    line=dict(color=GRID,        width=1,   dash="dash"), row=2, col=1)
+fig_comp.add_hline(y=0.5,  line=dict(color=LONG_COLOR,  width=0.8, dash="dot"),  row=2, col=1)
+fig_comp.add_hline(y=-0.5, line=dict(color=SHORT_COLOR, width=0.8, dash="dot"),  row=2, col=1)
+fig_comp.add_hline(y=1.0,  line=dict(color=LONG_COLOR,  width=0.8, dash="dot"),  row=4, col=1)
+fig_comp.add_hline(y=0,    line=dict(color=GRID,        width=1,   dash="dash"), row=4, col=1)
 
-# ── Entry vlines: one per contract at their actual td7 DTE ───────────────────
-# Each is a different x position (DTE varies per contract) — draw per-contract colored line
-for entry_x, color, label_str in [
+# ── Entry vlines per contract ─────────────────────────────────────────────────
+for entry_x, vcolor, label_str in [
     (curr_entry_dte,  CURR_COLOR,  f"td7 ({contract_letter}{str(selected_year)[-2:]})"),
     (prev1_entry_dte, PREV1_COLOR, f"td7 ({p1_letter}{str(p1_yr)[-2:]})"),
     (prev2_entry_dte, PREV2_COLOR, f"td7 ({p2_letter}{str(p2_yr)[-2:]})"),
 ]:
     if entry_x is None:
         continue
-    for row_n in [1, 2, 3]:
+    for row_n in [1, 2, 3, 4]:
         fig_comp.add_vline(
             x=entry_x,
-            line=dict(color=color, width=1.0, dash="dash"),
+            line=dict(color=vcolor, width=1.0, dash="dash"),
             annotation_text=label_str if row_n == 1 else "",
-            annotation_font=dict(color=color, size=9),
+            annotation_font=dict(color=vcolor, size=9),
             row=row_n, col=1,
         )
 
-# ── Exit vline: DTE3 is fixed across all contracts ───────────────────────────
-for row_n in [1, 2, 3]:
+# ── Exit vline ────────────────────────────────────────────────────────────────
+for row_n in [1, 2, 3, 4]:
     fig_comp.add_vline(
         x=3,
         line=dict(color=SHORT_COLOR, width=1.4, dash="dash"),
@@ -434,7 +471,7 @@ fig_comp.update_layout(
     template=PLOT_TEMPLATE,
     paper_bgcolor=PAPER,
     plot_bgcolor=PAPER,
-    height=720,
+    height=900,
     margin=dict(l=10, r=10, t=40, b=10),
     legend=dict(
         orientation="h", y=1.03, x=0,
@@ -442,15 +479,14 @@ fig_comp.update_layout(
     ),
     font=dict(color=TEXT),
     hovermode="x unified",
-    bargap=0.1,
+    bargap=0.05,
 )
-# Reverse x on all rows (DTE counts down toward expiry)
-for row_n in [1, 2, 3]:
+for row_n in [1, 2, 3, 4]:
     fig_comp.update_xaxes(
         autorange="reversed",
         showgrid=True, gridcolor=GRID,
         tickfont=dict(size=10, color=SUBTEXT),
-        title_text="Trading Days to Expiry (DTE) →" if row_n == 3 else "",
+        title_text="Trading Days to Expiry (DTE) →" if row_n == 4 else "",
         row=row_n, col=1,
     )
 fig_comp.update_yaxes(showgrid=True, gridcolor=GRID, tickfont=dict(size=10, color=SUBTEXT))
